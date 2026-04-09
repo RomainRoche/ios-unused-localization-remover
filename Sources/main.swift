@@ -1,6 +1,26 @@
 import Foundation
 import ArgumentParser
 
+// MARK: - Supporting Types
+
+struct ProcessResult {
+    let totalKeys: Int
+    let unusedKeys: [String]
+    let excludedKeys: [String]
+}
+
+// MARK: - Shared Regex
+
+/// Matches a .strings key line: `"KEY" = ...`
+/// Capturing group 1 is the key. Reused by both the parser and the remover.
+private let keyLineRegex: NSRegularExpression = {
+    // swiftlint:disable:next force_try
+    try! NSRegularExpression(
+        pattern: #"^\s*"((?:[^"\\]|\\.)+)"\s*="#,
+        options: [.anchorsMatchLines]
+    )
+}()
+
 // MARK: - Entry Point
 
 @main
@@ -32,15 +52,19 @@ struct LocalizationCleaner: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable verbose output.")
     var verbose: Bool = false
 
-    @Option(name: .long, help: "Maximum number of concurrent tasks.")
+    @Option(name: .long, help: "Maximum number of concurrent tasks (must be >= 1).")
     var concurrency: Int = ProcessInfo.processInfo.activeProcessorCount
 
     // MARK: - Run
 
     mutating func run() async throws {
+        guard concurrency >= 1 else {
+            throw ValidationError("--concurrency must be at least 1.")
+        }
+
         let rootURL = URL(fileURLWithPath: directory).standardized
 
-        print("🔍 Starting Localization Cleaner")
+        print("Starting Localization Cleaner")
         print("   Root:        \(rootURL.path)")
         print("   Locale:      \(locale)")
         print("   Dry run:     \(dryRun)")
@@ -50,45 +74,45 @@ struct LocalizationCleaner: AsyncParsableCommand {
         }
         print("")
 
-        // Build combined regex from all patterns
-        let excludeRegex: NSRegularExpression? = excludePattern.isEmpty ? nil : try {
+        // Build combined regex from all exclude patterns.
+        let excludeRegex: NSRegularExpression? = try excludePattern.isEmpty ? nil : {
             let combined = excludePattern
                 .map { "(?:\($0))" }
                 .joined(separator: "|")
             return try NSRegularExpression(pattern: combined)
         }()
 
-        // 1. Find all .strings files in the target locale lproj folders
+        // 1. Find all .strings files in the target locale lproj folders.
         let stringsFiles = findStringsFiles(in: rootURL, locale: locale)
 
         guard !stringsFiles.isEmpty else {
-            print("⚠️  No .strings files found for locale '\(locale)' in \(rootURL.path)")
+            print("No .strings files found for locale '\(locale)' in \(rootURL.path)")
             return
         }
 
-        print("📄 Found \(stringsFiles.count) .strings file(s):")
+        print("Found \(stringsFiles.count) .strings file(s):")
         stringsFiles.forEach { print("   - \($0.relativePath(from: rootURL))") }
         print("")
 
-        // 2. Find all source files (.swift, .m, .h)
+        // 2. Find all source files (.swift, .m, .h, .xib, .storyboard, .plist).
         let sourceFiles = findSourceFiles(in: rootURL)
 
         guard !sourceFiles.isEmpty else {
-            print("⚠️  No source files (.swift, .m, .h) found in \(rootURL.path)")
+            print("No source files (.swift, .m, .h) found in \(rootURL.path)")
             return
         }
 
         if verbose {
-            print("🗂  Found \(sourceFiles.count) source file(s)")
+            print("Found \(sourceFiles.count) source file(s)")
             print("")
         }
 
-        // 3. Load all source file contents in parallel
-        print("⚡️ Loading source files with up to \(concurrency) concurrent tasks…")
+        // 3. Load all source file contents in parallel.
+        print("Loading source files with up to \(concurrency) concurrent tasks...")
         let sourceContents = try await loadFilesInParallel(sourceFiles, maxConcurrency: concurrency)
         print("   Done.\n")
 
-        // 4. Process each .strings file
+        // 4. Process each .strings file.
         var totalUnused = 0
         var totalRemoved = 0
 
@@ -105,21 +129,21 @@ struct LocalizationCleaner: AsyncParsableCommand {
                 if !dryRun {
                     try removeUnusedKeys(from: stringsFile, keys: Set(result.unusedKeys))
                     totalRemoved += result.unusedKeys.count
-                    print("   ✅ Removed \(result.unusedKeys.count) key(s) from \(stringsFile.relativePath(from: rootURL))\n")
+                    print("   Removed \(result.unusedKeys.count) key(s) from \(stringsFile.relativePath(from: rootURL))\n")
                 }
             } else {
-                print("✅ \(stringsFile.relativePath(from: rootURL)) — no unused keys found\n")
+                print("\(stringsFile.relativePath(from: rootURL)) — no unused keys found\n")
             }
         }
 
-        // 5. Summary
+        // 5. Summary.
         print("─────────────────────────────────────────")
-        print("📊 Summary")
+        print("Summary")
         print("   .strings files scanned : \(stringsFiles.count)")
         print("   Source files scanned   : \(sourceFiles.count)")
         print("   Unused keys found      : \(totalUnused)")
         if dryRun {
-            print("   ℹ️  Dry run — no files were modified.")
+            print("   Dry run — no files were modified.")
         } else {
             print("   Keys removed           : \(totalRemoved)")
         }
@@ -128,10 +152,17 @@ struct LocalizationCleaner: AsyncParsableCommand {
 
     // MARK: - File Discovery
 
-    // MARK: - Helpers (File Discovery)
+    /// Returns true when the URL lives inside a directory that should be excluded
+    /// from scanning (Pods, SPM .build directory, or DerivedData).
+    private func isInExcludedFolder(_ url: URL, relativeTo root: URL) -> Bool {
+        let rootComponents = root.standardized.pathComponents
+        let urlComponents = url.standardized.pathComponents
 
-    private func isInPodsFolder(_ url: URL) -> Bool {
-        url.pathComponents.contains("Pods")
+        // Only look at components that are *below* the root to avoid false
+        // positives from directory names that appear in the root path itself.
+        let relativeComponents = urlComponents.dropFirst(rootComponents.count)
+        let excluded: Set<String> = ["Pods", ".build", "DerivedData"]
+        return relativeComponents.contains { excluded.contains($0) }
     }
 
     private func findStringsFiles(in root: URL, locale: String) -> [URL] {
@@ -143,7 +174,7 @@ struct LocalizationCleaner: AsyncParsableCommand {
 
         return enumerator
             .compactMap { $0 as? URL }
-            .filter { !isInPodsFolder($0) }
+            .filter { !isInExcludedFolder($0, relativeTo: root) }
             .filter { $0.pathExtension == "strings" }
             .filter { $0.pathComponents.contains("\(locale).lproj") }
     }
@@ -156,17 +187,16 @@ struct LocalizationCleaner: AsyncParsableCommand {
         ) else { return [] }
 
         let validExtensions = Set(["swift", "m", "h", "plist", "xib", "storyboard"])
-        
+
         return enumerator
             .compactMap { $0 as? URL }
-            .filter { !isInPodsFolder($0) }          // ← exclude Pods
+            .filter { !isInExcludedFolder($0, relativeTo: root) }
             .filter { validExtensions.contains($0.pathExtension) }
     }
 
-
     // MARK: - Parallel File Loading
 
-    func loadFilesInParallel(_ urls: [URL], maxConcurrency: Int) async throws -> [String] {
+    private func loadFilesInParallel(_ urls: [URL], maxConcurrency: Int) async throws -> [String] {
         try await withThrowingTaskGroup(of: (Int, String).self) { group in
             var results = [(Int, String)]()
             results.reserveCapacity(urls.count)
@@ -181,37 +211,39 @@ struct LocalizationCleaner: AsyncParsableCommand {
                 index += 1
                 inFlight += 1
                 group.addTask {
-                    let content = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-                    return (i, content)
+                    // Propagate read errors so we don't silently treat an
+                    // unreadable file as empty (which would flag all its keys
+                    // as unused).
+                    do {
+                        let content = try String(contentsOf: url, encoding: .utf8)
+                        return (i, content)
+                    } catch {
+                        fputs("Warning: could not read \(url.path): \(error.localizedDescription)\n", stderr)
+                        return (i, "")
+                    }
                 }
             }
 
-            // Seed initial tasks
+            // Seed initial tasks.
             while inFlight < maxConcurrency && index < urls.count {
                 addNext()
             }
 
-            // Drain and refill
+            // Drain and refill.
             while let (i, content) = try await group.next() {
                 inFlight -= 1
                 results.append((i, content))
                 addNext()
             }
 
-            // Re-order to match original URL order
+            // Re-order to match original URL order.
             return results.sorted { $0.0 < $1.0 }.map { $0.1 }
         }
     }
 
-    // MARK: - Strings File Parsing
+    // MARK: - Strings File Processing
 
-    struct ProcessResult {
-        let totalKeys: Int
-        let unusedKeys: [String]
-        let excludedKeys: [String]
-    }
-
-    func processStringsFile(
+    private func processStringsFile(
         _ url: URL,
         sourceContents: [String],
         excludeRegex: NSRegularExpression?,
@@ -238,26 +270,13 @@ struct LocalizationCleaner: AsyncParsableCommand {
             print("   \(url.relativePath(from: rootURL)): \(allKeys.count) keys, \(excluded.count) excluded, \(candidates.count) to check")
         }
 
-        // Check each candidate key in parallel across source contents
-        let unused = try await withThrowingTaskGroup(of: (String, Bool).self) { group in
-            var semaphoreCount = 0
-
-            for key in candidates {
-                group.addTask {
-                    let isUsed = sourceContents.contains { content in
-                        content.contains(key)
-                    }
-                    return (key, !isUsed)
-                }
-                semaphoreCount += 1
-            }
-
-            var unusedKeys: [String] = []
-            for try await (key, isUnused) in group {
-                if isUnused { unusedKeys.append(key) }
-            }
-            return unusedKeys.sorted()
-        }
+        // Check which candidate keys are absent from all source files.
+        // Search for the key wrapped in quotes to avoid substring false-positives
+        // (e.g. key "title" matching source that only contains "subtitle").
+        let unused: [String] = candidates.filter { key in
+            let quotedKey = "\"\(key)\""
+            return !sourceContents.contains { $0.contains(quotedKey) }
+        }.sorted()
 
         return ProcessResult(
             totalKeys: allKeys.count,
@@ -268,17 +287,9 @@ struct LocalizationCleaner: AsyncParsableCommand {
 
     // MARK: - Key Parsing
 
-    func parseKeys(from content: String) -> [String] {
-        // Matches: "KEY" = "VALUE";
-        // Also handles keys with escape sequences
-        let pattern = #"^\s*"((?:[^"\\]|\\.)+)"\s*="#
-        guard let regex = try? NSRegularExpression(
-            pattern: pattern,
-            options: [.anchorsMatchLines]
-        ) else { return [] }
-
+    private func parseKeys(from content: String) -> [String] {
         let range = NSRange(content.startIndex..., in: content)
-        let matches = regex.matches(in: content, range: range)
+        let matches = keyLineRegex.matches(in: content, range: range)
 
         return matches.compactMap { match -> String? in
             guard let keyRange = Range(match.range(at: 1), in: content) else { return nil }
@@ -288,27 +299,28 @@ struct LocalizationCleaner: AsyncParsableCommand {
 
     // MARK: - Key Removal
 
-    func removeUnusedKeys(from url: URL, keys: Set<String>) throws {
-        var content = try String(contentsOf: url, encoding: .utf8)
-        let lines = content.components(separatedBy: .newlines)
+    private func removeUnusedKeys(from url: URL, keys: Set<String>) throws {
+        let originalContent = try String(contentsOf: url, encoding: .utf8)
+        let lines = originalContent.components(separatedBy: .newlines)
+
+        // Detect and preserve the original trailing newline so we don't
+        // corrupt the file's line ending on every run.
+        let hadTrailingNewline = originalContent.hasSuffix("\n")
+
         var result: [String] = []
         var i = 0
 
-        // Regex to detect a key line: "KEY" = "VALUE";
-        let keyPattern = try NSRegularExpression(pattern: #"^\s*"((?:[^"\\]|\\.)+)"\s*="#)
-
         while i < lines.count {
             let line = lines[i]
-            let nsLine = line as NSString
-            let range = NSRange(location: 0, length: nsLine.length)
+            let range = NSRange(line.startIndex..., in: line)
 
-            if let match = keyPattern.firstMatch(in: line, range: range),
+            if let match = keyLineRegex.firstMatch(in: line, range: range),
                let keyRange = Range(match.range(at: 1), in: line) {
                 let key = String(line[keyRange])
                 if keys.contains(key) {
-                    // Skip this line (and remove trailing blank line if present)
+                    // Skip the key line and consume an immediately following
+                    // blank line to avoid leaving orphaned whitespace.
                     i += 1
-                    // Optionally eat the blank line after the entry
                     if i < lines.count && lines[i].trimmingCharacters(in: .whitespaces).isEmpty {
                         i += 1
                     }
@@ -319,18 +331,21 @@ struct LocalizationCleaner: AsyncParsableCommand {
             i += 1
         }
 
-        content = result.joined(separator: "\n")
-        try content.write(to: url, atomically: true, encoding: .utf8)
+        var output = result.joined(separator: "\n")
+        if hadTrailingNewline && !output.hasSuffix("\n") {
+            output += "\n"
+        }
+        try output.write(to: url, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Reporting
 
-    func printReport(for url: URL, result: ProcessResult, rootURL: URL) {
-        print("⚠️  \(url.relativePath(from: rootURL))")
+    private func printReport(for url: URL, result: ProcessResult, rootURL: URL) {
+        print("\(url.relativePath(from: rootURL))")
         print("   Total keys    : \(result.totalKeys)")
         print("   Excluded      : \(result.excludedKeys.count)")
         print("   Unused keys   : \(result.unusedKeys.count)")
-        result.unusedKeys.forEach { print("      🗑  \($0)") }
+        result.unusedKeys.forEach { print("      - \($0)") }
         print("")
     }
 }
